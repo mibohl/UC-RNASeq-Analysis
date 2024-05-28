@@ -1,0 +1,705 @@
+---
+title: "Ulcerative Colitis RNA-Seq Data Analysis"
+author: "Michael Bohl"
+date: "23 May 2024"
+output:
+  slidy_presentation:
+    transition: slide
+    css: style.css
+runtime: shiny
+---
+
+
+
+```{r libraries and data, warning=FALSE, message=FALSE, echo=FALSE}
+# load libraries and read in files
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(shiny)
+library(plotly)
+library(umap)
+library(Rtsne)
+library(DESeq2)
+library(edgeR)
+library(pheatmap)
+library(EnhancedVolcano)
+library(matrixStats)
+library(clusterProfiler)
+library(ReactomePA)
+library(org.Hs.eg.db)
+library(viridis)
+library(DT)
+
+
+
+# Read the gene expression data
+mat <- read.table(gzfile("./GSE107593_raw_reads_BCHRNAseq.txt.gz"), header = TRUE, sep = "\t")
+
+# Read the metadata
+metadata_text <- readLines("meta.txt")
+metadata <- list()
+for (line in metadata_text) {
+  elements <- unlist(strsplit(line, "\t")) 
+  key <- substr(elements[1], 2, nchar(elements[1]))
+  values <- gsub("\"", "",elements[2:length(elements)])
+
+  # Store in a nested list
+  if (key %in% names(metadata)) { 
+    metadata[[key]] <- c(metadata[[key]], values) 
+  } else {
+    metadata[[key]] <- values 
+  }
+}
+
+```
+
+
+## UC RNA-Seq Data Set Overview
+- 48 samples, 12 patients, 4 samples per patient; 2 inflammed, 2 non-inflammed
+- Relevant meta variables: **inflammation status**, **hospital**, **colon location**, and **patient**
+- Filtered genes with low expression (with less than 1 TPM in at least 50% of the samples)
+- 24362/60498 genes (~40 %) left after filtering
+```{r, echo=FALSE, warning=FALSE, fig.width=12, fig.height=5}
+# remove the first 9 uninformative rows and rearrange columns so that they are in the same order as the meta data
+gene_expr <- mat[,c("X157.6", "X157.3", "X157.4", "X157.3.1", "X877.3", "X877.6", "X877.2", "X877.4", "X1057.1", "X1057.2", "X1057.4", "X1057.6", "X1077.1", "X1077.2", "X1077.1.1", "X1077.4", "X1192.1", "X1192.3", "X1192.5", "X1192.6", "X1214.3", "X1214.4", "X1214.4.1", "X1214.6", "X8854D1", "X8854D2", "X8854A1", "X8854A3", "X8855A2", "X8855A3", "X8855D1", "X8855D2", "X8874D1", "X8874F2", "X8874A1", "X8874B1", "X8878.E4", "X8878D2", "X8878B1", "X8878C1", "X8879.E2", "X8879D1", "X8881A1", "X8881B1", "X8881.E2", "X8881F2", "X8879A1", "X8879B1")] 
+avg_expr <- rowMeans(gene_expr)
+
+# filter out the genes with low expression (0 expression in at least 50% of the samples are considered not expressed)
+gene_expr <- gene_expr[(rowMeans(gene_expr >=  1) > 0.5), ]
+
+# put filtered gene list into metadata data frame
+meta = data.frame(sample = colnames(gene_expr),
+                  inflammation_status = sub("^\\S+\\s*", "", metadata$Sample_characteristics_ch1[1:48]) %>% factor(),
+                  hospital = sub("^\\S+\\s*", "",metadata$Sample_characteristics_ch1[49:96]) %>% factor(),
+                  patient = sub("^\\S+\\s*", "", metadata$Sample_characteristics_ch1[145:192]) %>% factor(),
+                  colon_location = sub("^\\S+\\s*", "",metadata$Sample_characteristics_ch1[97:144]) %>% factor())
+
+
+# plot the distribution of the average gene expression before and after filtering
+par(mfrow = c(1, 2))
+# before filtering
+hist(log10(avg_expr + 1), xlab = "log10(TPM + 1)", main = "Average Gene Expression - Before Filtering", col = "lightblue", breaks = 30, xlim = c(0,7), ylim = c(0, 40000))
+# after filtering
+hist(log10(rowMeans(gene_expr) + 1), xlab = "log10(TPM + 1)", main = "Average Gene Expression - After Filtering", col = "lightblue", breaks = 30, xlim = c(0,7))
+
+# Calculate row-wise variances
+expr_variance <- apply(gene_expr[, -1], 1, var)
+                                                             
+# Sort the genes based on variance
+gene_expr <- gene_expr[names(sort(expr_variance, decreasing = TRUE)), ]
+
+# Select the top 500 genes with the highest variance
+top_500_genes <- head(gene_expr, 500)
+```
+
+----------------------------------------------------------------------------------------------------------------------------
+
+## Dimensionality Reduction
+- Can group differences be visualized with data reduced to 3 dimensions?
+- PCA, UMAP, and t-SNE don't show clear separation between different groups.
+```{r PCA, echo=FALSE, warning=FALSE}
+ui <- fluidPage(
+  sidebarLayout(
+    sidebarPanel(
+      selectInput("method", "Method:", 
+                  choices = c("PCA", "UMAP", "t-SNE")),
+      conditionalPanel(
+        condition = "input.method == 'PCA'",
+        sliderInput("num_genes_slider", "Number of Genes:",
+                    min = 100, max = nrow(gene_expr), value = 500, step = 100)
+      ),
+      selectInput("color_variable", "Color Variable:",
+                  choices = c("Inflammation Status" = "inflammation_status",
+                              "Patient" = "patient",
+                              "Hospital" = "hospital",
+                              "Colon Location" = "colon_location"),
+                  selected = "hospital")
+    ),
+    mainPanel(
+      plotlyOutput("plot", height = 500)
+    )
+  )
+)
+
+# Define server logic
+server <- function(input, output) {
+  output$plot <- renderPlotly({
+    # Calculate embedding or PCA based on user input
+    if (input$method == "PCA") {
+      pca_num_genes <- input$num_genes_slider
+      pca <- prcomp(t(gene_expr[1:pca_num_genes, ]), scale = TRUE, center = TRUE)
+      plot_data <- data.frame("V1" = pca$x[, 1], "V2" = pca$x[, 2], "V3" = pca$x[, 3], 
+                             meta, "dimensions" = paste0("PC", 1:3))
+    } else if (input$method == "UMAP") {
+      umap_result <- umap(t(top_500_genes), n_neighbors = 15, n_components = 3)
+      plot_data <- data.frame(umap_result$layout, meta, "dimensions" = c("UMAP1", "UMAP2", "UMAP3"))
+      colnames(plot_data)[1:3] <- c("V1", "V2", "V3")
+    } else { # t-SNE
+      tsne_result <- Rtsne(t(top_500_genes), dims = 3, perplexity = 15)
+      plot_data <- data.frame(tsne_result$Y, meta, "dimensions" = c("t-SNE1", "t-SNE2", "t-SNE3"))
+      colnames(plot_data)[1:3] <- c("V1", "V2", "V3")
+    }
+
+    # Create 3D scatter plot
+    plot_ly(data = plot_data,
+            x = ~V1,
+            y = ~V2,
+            z = ~V3,
+            color = ~get(input$color_variable),
+            colors = c("#FF0000", "#0000FF", "#00FF00", "#00FFFF", "#FF00FF", "#FFFF00",
+                       "#FFA500", "#800080", "#008080", "#FFC0CB", "darkgreen", "#4B0082"),
+            type = "scatter3d",
+            mode = "markers") %>%
+      layout(scene = list(xaxis = list(title = ~dimensions[1]),
+                          yaxis = list(title = ~dimensions[2]),
+                          zaxis = list(title = ~dimensions[3]),
+                          aspectratio = list(x = 1, y = 1, z = 1)))
+  })
+}
+
+
+shinyApp(ui = ui, server = server, options=list(height = 600))
+
+```
+
+----------------------------------------------------------------------------------------------------------------------------
+
+## Statistical Association between PCs and Metadata
+- PC scores are not normally distributed\
+→ Spearman correlation between PCs and metadata\
+→ Kruskal-Wallis test between PCs and metadata
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+# find out which metadata is most strongly correlated with the first PCA
+pca <- prcomp(t(top_500_genes), center = TRUE, scale = TRUE)
+pca_data <- data.frame(PC1 = pca$x[,1], PC2 = pca$x[,2], PC3 = pca$x[,3], PC4 = pca$x[,4], PC5 = pca$x[,5],
+               group = meta$inflammation_status,
+               patient = meta$patient,
+               colon_location = meta$colon_location,
+               hospital = meta$hospital)
+
+# create binary matrix
+labelled_expr_data <- model.matrix(~ ., data = meta)[, -1]
+
+# ilustrative matrix
+data_illustration <- data.frame(
+  "PC score" = c(-7.389, 2.9944, -29.549, "..."),
+  "Inflammed" = c(0, 1, 1, "..."),
+  "Hospital Brigham and ..."= c(0, 0, 1, "..."),
+  "Patient 1" = c(0, 0, 0, "..."),
+  "Patient 2" = c(1, 0, 0, "..."),
+  "Patient 3" = c(0, 0, 1, "..."),
+  "Location rectum" = c(1, 0, 0, "..."),
+  "Location large colon" = c(0, 1, 0, "...")
+)
+
+
+# Define UI
+ui <- fluidPage(
+    sidebarLayout(
+        sidebarPanel(
+            selectInput("pc", "Select Principal Component:",
+                        choices = paste0("PC", 1:5), selected = "PC3"),
+            plotOutput("elbowPlot")
+        ),
+        mainPanel(
+            div(class = "main-panel",
+                DTOutput("data_illustration", width = "90%"),
+                br(),
+                h3("Spearman Correlation"),
+                verbatimTextOutput("spearman_corr"),
+                h3("Kruskal-Wallis Test"),
+                verbatimTextOutput("kruskal_wallis"),
+                
+            )
+        )
+    )
+)
+
+# Define server logic required to perform PCA and calculate correlations
+server <- function(input, output) {
+    # Create a reactive expression for the selected PC
+    selected_pc <- reactive({
+        input$pc
+    })
+    
+    spearman_corr <- reactive({
+        selected_pc <- selected_pc()
+        spearman_corr_matrix <- cor(pca_data[selected_pc], labelled_expr_data, method = "spearman")
+        spearman_corr_df <- as.data.frame(spearman_corr_matrix)
+        
+        # Calculate average correlation for patients
+        spearman_corr_df$patients <- rowMeans(abs(spearman_corr_df[, grep("patient", colnames(spearman_corr_df))]))
+        spearman_corr_df$colon_location <- rowMeans(abs(spearman_corr_df[, grep("colon_location", colnames(spearman_corr_df))]))
+        spearman_corr_df$inflammation_status <- spearman_corr_df[,"inflammation_statusNon-Inflamed"]
+        spearman_corr_df$hospital <- spearman_corr_df[,"hospitalBrigham and Women's Hospital"]
+        
+        # Keep only relevant columns
+        spearman_corr_df <- spearman_corr_df[, c("inflammation_status", "hospital", "patients", "colon_location")]
+        spearman_corr_df
+    })
+    
+    kruskal_wallis_tests <- reactive({
+        selected_pc <- selected_pc()
+        tests <- list(
+            inflammation_status = kruskal.test(as.formula(paste(selected_pc, "~ group")), data = pca_data),
+            patient = kruskal.test(as.formula(paste(selected_pc, "~ patient")), data = pca_data),
+            hospital = kruskal.test(as.formula(paste(selected_pc, "~ hospital")), data = pca_data),
+            colon_location = kruskal.test(as.formula(paste(selected_pc, "~ colon_location")), data = pca_data)
+        )
+        data.frame("inflammation_status" = tests$inflammation_status$p.value,
+        "patient" = tests$patient$p.value,
+        "hospital" = tests$hospital$p.value,
+        "colon_location" = tests$colon_location$p.value, 
+        row.names = c("p-value"))
+    })
+    
+    output$spearman_corr <- renderPrint({
+        spearman_corr()
+    })
+    
+    output$kruskal_wallis <- renderPrint({
+        kruskal_wallis_tests()
+    })
+
+    # Create the reactive elbow plot
+    output$elbowPlot <- renderPlot({
+        variance_explained <- pca$sdev^2 / sum(pca$sdev^2)
+        elbow_data <- data.frame(PC = 1:length(variance_explained), VarianceExplained = variance_explained)
+        
+        selected_pc_num <- as.numeric(sub("PC", "", selected_pc()))
+
+        ggplot(elbow_data[c(1:15),], aes(x = PC, y = VarianceExplained)) +
+            geom_point(size = 3, color = "steelblue") +
+            geom_line(color = "steelblue", linetype = "dashed") +
+            geom_point(data = subset(elbow_data, PC == selected_pc_num), 
+                       aes(x = PC, y = VarianceExplained), 
+                       size = 4, color = "red") +
+            scale_x_continuous(breaks = 1:15) +
+            labs(title = "PCA Elbow Plot",
+                 x = "First 15 PCs",
+                 y = "Proportion of Variance Explained") +
+            theme_minimal() +
+            theme(
+                plot.title = element_text(hjust = 0.5, size = 16),
+                axis.title = element_text(size = 14),
+                axis.text = element_text(size = 12),
+                panel.grid.minor = element_blank(),
+                panel.grid.major = element_blank(),
+                panel.background = element_rect(fill = "transparent", color = NA),
+                plot.background = element_rect(fill = "transparent", color = NA)
+            )
+    }, bg = "transparent")
+    output$data_illustration <- renderDT({
+        datatable(data_illustration, rownames = FALSE, class = c('compact', 'hover'), options = list(dom = 't', width = "25%", length = 4))
+    })
+}
+
+
+shinyApp(ui = ui, server = server, options = list(height = 600))
+```
+
+--------------------------------------------------------------------------------------------------------------------------
+
+## Understanding the Principal Components
+- Which 10 genes contribute most to PC1 and PC2?
+
+<div align="center">
+```{r top10, echo=FALSE, warning=FALSE, message=FALSE}
+# Task2: find the absolute loadings for the first and second PCA
+absolute_loadings <- abs(pca$rotation[, 1:2])
+
+# Find the top 10 genes with the highest loadings for the first PCA
+top_10_genes_PCA1 <- rownames(absolute_loadings[order(absolute_loadings[, 1], decreasing = TRUE), ]) %>% head(.,10) %>% mat[.,]
+
+# Find the top 10 genes with the highest loadings for the second PCA
+top_10_genes_PCA2 <- rownames(absolute_loadings[order(absolute_loadings[, 2], decreasing = TRUE), ])  %>% head(.,10) %>% mat[.,]
+
+
+# return a table with top 10 genes for PC1 and PC2 including their absolute loadings and their biological significance
+top_10_genes_PCA1 <- data.frame(Gene = top_10_genes_PCA1$gene_name, Loading = pca$rotation[rownames(top_10_genes_PCA1), 1], PC = "PC1", Description = c("apoptosis regulation", "mitochondrial carrier protein", "ATP Synthase F1", "immune cell adhesion and signalling", "GTPase involved in multiple signal transduction pathways", "cell-cell-adhesion", "cell cycle control and apoptosis", "actin cytoskeleton organization and cell motility", "calmodulin - calcium signalling", "mitochondrial electron transport chain"))
+
+top_10_genes_PCA2 <- data.frame(Gene = top_10_genes_PCA2$gene_name, Loading = pca$rotation[rownames(top_10_genes_PCA2), 2],PC = "PC2", Description = c("lymphocyte activation and recirculation", "MHC class II", "protein kinase involved in glycolysis", "cell shape, adhesion, and signal transduction", "filamin A - crosslinks actin filaments into networks", "formation and transport of MHC class II molecules", "disulfide bond formation and rearrangement", "filament protein responsible for cell integrity", "MHC class II molecule", "tropomyosin - stabilization and interaction of actin filaments "))
+
+
+
+# put everything into a data table
+top_genes <- rbind(top_10_genes_PCA1, top_10_genes_PCA2)
+
+datatable(top_genes, rownames = FALSE, class = c('compact', 'hover', 'stripe') , options = list(dom = 'tip',
+          pageLength = 10), width = "80%")
+
+
+```
+</div>
+----------------------------------------------------------------------------------------------------------------------------
+
+## Differential Expression Analysis
+- inflammed vs non-inflammed 
+<ul class="incremental">
+<li>11/20 DESeq2 and EdgeR genes overlap</li>
+</ul>
+
+```{r DE_Analysis, message = FALSE, warning=FALSE, echo=FALSE}
+# Task3: Perform a DE analysis with inflammed and non-inflammed samples
+
+# Compute DESeq2 results
+dds <- DESeqDataSetFromMatrix(countData = gene_expr, colData = meta, design = ~ inflammation_status)
+dds <- DESeq(dds)
+res_deseq <- results(dds)
+res_deseq_df <- as.data.frame(res_deseq)
+res_deseq_df$gene_name <- mat[rownames(res_deseq_df),]$gene_name
+
+diff_expr_genes_deseq <- data.frame(Gene = head(filter(res_deseq_df, padj < 0.07, abs(log2FoldChange) > 1)$gene_name, 20), logFC = head(filter(res_deseq_df, padj < 0.07, abs(log2FoldChange) > 1)$log2FoldChange, 20), BH_adjusted_pvalue = head(filter(res_deseq_df, padj < 0.07, abs(log2FoldChange) > 1)$padj, 20))
+
+# Compute EdgeR results
+DGE <- DGEList(counts = gene_expr, group = meta$inflammation_status) #+ meta$patient)
+design <- model.matrix(~inflammation_status, data = meta)
+DGE <- estimateDisp(DGE, design)
+fit <- glmFit(DGE, design)
+lrt <- glmLRT(fit, coef = 2)
+
+# add column: adjusted p value
+lrt$table$padj <- p.adjust(lrt$table$PValue, method = "BH")
+
+# sort lrt object based on adjusted p value
+lrt$table <- lrt$table[order(lrt$table$padj),]
+
+top_20_DE_genes_edgeR <- data.frame(Gene = mat[rownames(topTags(lrt, n = 20)$table),]$gene_name, logFC = topTags(lrt, n = 20)$table$logFC, BH_adjusted_pvalue = topTags(lrt, n = 20)$table$FDR)
+
+ui <- fluidPage(
+  sidebarLayout(
+    sidebarPanel(
+      width = 6,
+      radioButtons("method", "Method:", 
+                   c("DESeq2" = "DESeq2",
+                     "EdgeR" = "EdgeR")),
+      br(), # Add a line break
+      h4("Top 20 Differentially Expressed Genes:"), #
+      DTOutput("top_genes") # Move the data table output to the sidebar
+    ),
+    mainPanel(
+      width = 6,
+      plotOutput("volcano_plot", height = "450px")
+    )
+  )
+)
+
+# Define server logic
+server <- function(input, output) {
+  output$volcano_plot <- renderPlot({
+    if(input$method == "DESeq2") {
+      EnhancedVolcano(res_deseq_df, lab = res_deseq_df$gene_name, x = 'log2FoldChange', y = 'padj',
+                      xlim = c(-5, 5), ylim = c(0-0.1,6.5), title = 'DE Genes - DESeq2', 
+                      subtitle = "Volcano Plot",
+                      pCutoff = 0.05, FCcutoff = 1,
+                      legendLabels = c('Not sig.', 'Log2FC', 'p-value', 'Log2FC & p-value'),
+                      legendPosition = 'right',
+                      legendLabSize = 16,
+                      legendIconSize = 5.0)
+
+    } else {
+      EnhancedVolcano(lrt$table, lab = mat[rownames(lrt),]$gene_name , x = "logFC", y = 'padj',
+                      xlim = c(-5, 5), ylim = c(0-0.1,6.5), title = 'DE Genes - EdgeR', 
+                      subtitle = "Volcano Plot",
+                      pCutoff = 0.05, FCcutoff = 1,
+                      legendLabels = c('Not sig.', 'Log2FC', 'p-value', 'Log2FC & p-value'),
+                      legendPosition = 'right', 
+                      legendLabSize = 16,
+                      legendIconSize = 5.0)
+    }
+  })
+  
+  output$top_genes <- renderDataTable({
+    if(input$method == "DESeq2") { datatable(diff_expr_genes_deseq, 
+          rownames = FALSE, options = list(pageLength = 10, dom = 'tip') , class = c('compact','hover', 'stripe'))
+    } else {
+      datatable(top_20_DE_genes_edgeR, rownames = FALSE, options = list(pageLength = 10, dom = 'tip'), class = c('compact','hover', 'stripe'))
+    }
+  })
+}
+
+# Run the application
+shinyApp(ui = ui, server = server, options = list(height = 600))
+```
+
+----------------------------------------------------------------------------------------------------------------
+
+## Variability Across Patients - First Attempt
+```{r test2, echo=FALSE, warning=FALSE, fig.align='center'}
+#combine top DE genes from DESesq2 and EdgeR
+top_20_DE_genes <- c(top_20_DE_genes_edgeR$Gene, diff_expr_genes_deseq$Gene)
+
+# extract expression of the DE genes
+top_20_DE_genes_expr <- mat[which(mat$gene_name %in% top_20_DE_genes),10:57] 
+top_20_DE_genes_expr_inflammed <- top_20_DE_genes_expr[,meta$inflammation_status == "Inflamed"] %>% t() %>% as.data.frame()
+rownames(top_20_DE_genes_expr_inflammed) <- paste(c(1:nrow(top_20_DE_genes_expr_inflammed)), "INF")
+
+top_20_DE_genes_expr_non_inflammed <- top_20_DE_genes_expr[,meta$inflammation_status != "Inflamed"] %>% t() %>% as.data.frame()
+rownames(top_20_DE_genes_expr_non_inflammed) <- paste(c(1:nrow(top_20_DE_genes_expr_non_inflammed)), "NO_INF")
+
+# combine both data frames into one
+top_20_DE_genes_expr <- rbind(top_20_DE_genes_expr_inflammed, top_20_DE_genes_expr_non_inflammed)
+colnames(top_20_DE_genes_expr) <- mat[colnames(top_20_DE_genes_expr),]$gene_name
+
+
+
+pheatmap(as.matrix(top_20_DE_genes_expr), cluster_rows = FALSE, cluster_cols = TRUE, 
+         fontsize = 8, show_rownames = TRUE, show_colnames = TRUE, 
+         scale = "none", main = "Top DE Genes Expression Heatmap",
+         breaks = seq(-10, 5000, length.out = 100),
+         color = rev(inferno(100)))
+
+```
+
+----------------------------------------------------------------------------------------------------------------------------
+
+## Inter-Patient Variability of DE Gene Expression
+
+```{r heatmap, echo=FALSE}
+# visualize the expression level of the top 20 DE genes for every patient in a heatmap
+library(pheatmap)
+top_20_DE_genes <- unique(c(top_20_DE_genes_edgeR$Gene, diff_expr_genes_deseq$Gene))
+
+# Function to average every two rows
+average_rows <- function(df) {
+  n <- nrow(df)
+  
+  # Ensure there is an even number of rows
+  if (n %% 2 != 0) {
+    stop("The number of rows in the data frame must be even.")
+  }
+  
+  averaged_df <- data.frame(matrix(nrow = n / 2, ncol = ncol(df)))
+  colnames(averaged_df) <- colnames(df)
+  
+  # Calculate the average for each pair of adjacent rows
+  for (i in seq(1, n, by = 2)) {
+    patient <- 
+    averaged_df[(i + 1) / 2, ] <- apply(df[i:(i + 1), ], 2, mean)
+    # replace 0 with 0.0001
+    averaged_df[averaged_df == 0] <- 0.0001
+  }
+  
+  return(averaged_df)
+}
+
+
+exp_matrix = mat[,10:57]
+
+# only take protein coding genes
+top_20_DE_genes_expr <- exp_matrix[as.character(which(mat$gene_name %in% top_20_DE_genes & (mat$gene_type == "protein_coding" | mat$gene_typ == "IG_V_gene" | mat$gene_typ == "IG_C_gene"))),] 
+
+
+# split the data into inflammed and non-inflammed samples
+top_20_DE_genes_expr_inflammed <- top_20_DE_genes_expr[,meta$inflammation_status == "Inflamed"] %>% t() 
+top_20_DE_genes_expr_non_inflammed <- top_20_DE_genes_expr[,meta$inflammation_status != "Inflamed"] %>% t()
+
+# apply (self defined) average_rows function to the expression data
+top_20_DE_genes_expr_inflammed <- average_rows(top_20_DE_genes_expr_inflammed)
+top_20_DE_genes_expr_non_inflammed <- average_rows(top_20_DE_genes_expr_non_inflammed)
+
+# compute DE ratios
+ratios <- as.matrix(top_20_DE_genes_expr_inflammed / top_20_DE_genes_expr_non_inflammed)
+```
+
+<div class="two-column">
+  <div class="column">
+  - 2 inflammed + 2 non-inflammed samples per patient
+  - took the average of the 2 inflammed and 2 non-inflammed samples respectively\
+
+$$
+DEratio = \frac{avg.expr_{inf}}{avg.expr_{non-inf}}
+$$
+  </div>
+  <div class="column">
+
+```{r ComplexHeatmap, echo=FALSE, message=FALSE, warning=FALSE, fig.align='left'}
+# Assign the appropriate column names back to the new data frame
+colnames(ratios) <- mat[rownames(top_20_DE_genes_expr),]$gene_name
+rownames(ratios) <- paste("Patient", 1:nrow(ratios))
+
+library(ComplexHeatmap)
+suppressPackageStartupMessages(library(circlize))
+
+col_fun = colorRamp2(c(-5, 0, 5), c("blue", "white", "red"))
+Heatmap(log2(ratios),
+        col = col_fun,  # Blue-white-red color scale
+        name = "log2 Expression",  # Title for the color key/legend
+        cluster_rows = FALSE,  # Disable row clustering (if desired)
+        cluster_columns = TRUE,  # Enable column clustering (if desired)
+        row_names_gp = gpar(fontsize = 8), # Adjust row names font size
+        column_names_gp = gpar(fontsize = 8), # Adjust column names font size
+        column_title = "Genes",
+        row_title = "Patients", 
+        row_title_side = "right",
+        rect_gp = gpar(col = "grey", lwd = 0.1),
+        heatmap_legend_param = list(title = "log2(DE.ratio)"))
+```
+
+  </div>
+</div>
+
+----------------------------------------------------------------------------------------------------------------------------
+## Pathway Gene Set Enrichment Analysis
+- used ReactomePA and clusterProfiler to perform GSEA on the differentially expressed genes\
+
+```{r enrichment, warning=FALSE, echo=FALSE, message=FALSE}
+# define a function to perform GSEA
+GSEA <- function(gene_list) {
+  gene_list <- gene_list %>% arrange(desc(log2FoldChange))
+  
+  # remove non coding genes
+  gene_list <- filter(gene_list, mat[rownames(gene_list),]$gene_type == "protein_coding")
+  
+  
+  # Convert gene symbols to Entrez IDs
+  genes_entrez <- bitr(gene_list$gene_name, 
+                       fromType = "SYMBOL", 
+                       toType = "ENTREZID", 
+                       OrgDb = org.Hs.eg.db)
+  
+  # Handle duplicates by keeping only the first mapping or summarizing appropriately
+  genes_entrez <- genes_entrez %>%
+    group_by(SYMBOL) %>%
+    slice_head(n = 1) %>%
+    ungroup()
+  
+  # Merge gene_list with genes_entrez to preserve ranking order
+  gene_list <- gene_list %>%
+    inner_join(genes_entrez, by = c("gene_name" = "SYMBOL"))
+  
+  # Check if the merging step resulted in any duplicates and ensure unique Entrez IDs
+  gene_list <- gene_list %>%
+    distinct(ENTREZID, .keep_all = TRUE)
+
+  # Create a named vector of log2FoldChange with Entrez IDs as names
+  ranked_genes <- gene_list$log2FoldChange
+  names(ranked_genes) <- gene_list$ENTREZID
+  
+  
+  # Ensure the gene list is sorted in decreasing order
+  ranked_genes <- sort(ranked_genes, decreasing = TRUE)
+  
+  # Perform GSEA with Reactome pathways
+  reactome_gsea_result <- gsePathway(
+    geneList = ranked_genes,
+    organism = "human",
+    pvalueCutoff = 0.05,
+    pAdjustMethod = "BH", # Benjamini-Hochberg adjustment
+    verbose = TRUE,
+    BPPARAM = BiocParallel::SerialParam()
+  )
+  
+
+  return(reactome_gsea_result[order(abs(reactome_gsea_result$NES), decreasing = TRUE),])
+
+}
+
+DESeq2_GSEA <- GSEA(filter(res_deseq_df, padj < 0.9)) 
+EdgeR_GESA <- (data.frame(gene_name = mat[rownames(lrt$table),]$gene_name,log2FoldChange = lrt$table$logFC, padj = lrt$table$padj) %>% filter(padj < 0.9) %>% GSEA())
+```
+
+```{r gsea_plot, message=FALSE, warning=FALSE, echo=FALSE}
+
+#immuno_genes <- filter(ranked_genes, mat[rownames(ranked_genes),]$gene_type %in% mat[grep("^IG_", mat$gene_type),]$gene_type)
+
+ui <- fluidPage(
+  sidebarLayout(
+    sidebarPanel(
+      # radio buttons
+      radioButtons("method", "Method:", 
+                   c("DESeq2" = "DESeq2",
+                     "EdgeR" = "EdgeR")),
+      
+      sliderInput("x", "Number of pathways to display:", 
+                  min = 1, max = 100, value = 12),
+      # checkbox to display pathways descriptions
+      checkboxInput("showDescriptions", "Print pathways", FALSE)
+    ),
+    mainPanel(
+      plotOutput("gsea_plot"),
+      verbatimTextOutput("pathways")
+    )
+  ))
+server <- function(input, output) {
+  output$gsea_plot <- renderPlot({
+    if(input$method == "DESeq2") {
+      DESeq2_GSEA %>% head(input$x) %>%
+        ggplot(aes(x = reorder(Description, NES), y = NES, size = setSize, color = p.adjust)) +
+    geom_point(alpha = 0.7) +
+    coord_flip() +
+    scale_color_gradient(low = "blue", high = "red") +
+    labs(title = "Reactome Pathway GSEA", x = "Pathway", y = "Normalized Enrichment Score (NES)") +
+    theme_minimal()
+    } else {
+      EdgeR_GESA %>% head(input$x) %>%
+        ggplot(aes(x = reorder(Description, NES), y = NES, size = setSize, color = p.adjust)) +
+    geom_point(alpha = 0.7) +
+    coord_flip() +
+    scale_color_gradient(low = "blue", high = "red") +
+    labs(title = "Reactome Pathway GSEA", x = "Pathway", y = "Normalized Enrichment Score (NES)") +
+    theme_minimal()
+    }
+  })
+  output$pathways <- renderPrint({
+    if (input$showDescriptions) {
+      if(input$method == "DESeq2") {
+        DESeq2_GSEA$Description %>% head(input$x)
+      } else {
+        EdgeR_GESA$Description %>% head(input$x)
+      }
+    }
+  })
+}
+
+  
+# run app
+shinyApp(ui = ui, server = server, options = list(height = 650))
+
+```
+
+## Tissue and Cell Type Enrichment Analysis
+- Used the EnrichR library
+- Ran genes with > 1.5 absolute log2FC and < 0.1 FDR through **Human Gene Atlas** and **ARCHS4 Tissues** databases
+
+
+```{r Tissue and Cell Type Enrichment, warning=FALSE, results='hide', echo = FALSE, message=FALSE}
+library(enrichR)
+
+filtered <- head(dplyr::filter(res_deseq_df, padj < 0.1 & abs(log2FoldChange) > 1.5), 40) # filter out highly DE genes
+highly_upregulated_genes <- filtered$gene_name
+
+
+
+databases <- c("Human_Gene_Atlas","ARCHS4_Tissues")
+# Run enrichment analysis
+tables <- enrichr(highly_upregulated_genes, databases)
+print(tables$Human_Gene_Atlas)
+```
+
+
+<div align="center">
+```{r, echo=FALSE}
+datatable(tables$Human_Gene_Atlas[c(1,2,4,7,9)], rownames = FALSE, options = list(dom = 't', pageLength = 10), class = c('compact','hover'), width = "85%", caption = "Human Gene Atlas")
+```
+
+<br>
+
+```{r, echo=FALSE}
+datatable(tables$ARCHS4_Tissues[c(1,2,4,7,9)], rownames = FALSE, options = list(dom = 't', pageLength = 10), class = c('compact','hover'), width = "85%", caption = "ARCHS4 Tissues")
+```
+</div>
+
+## Thank you for your attention!
+
+
+
+<div style="position: absolute; bottom: 20px; width: 90%;">
+  <p style="text-align: center;">
+  The source code for this presentation can be found at: [github.com/mibohl/UC-RNASeq-Analysis](https://github.com/mibohl/UC-RNASeq-Analysis)
+  </p>
+</div>
